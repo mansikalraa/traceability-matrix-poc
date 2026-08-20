@@ -59,19 +59,48 @@ from reportlab.platypus import (
 
 
 # ==============================================================================
-# GitHub API & Metadata Fetcher
+# GitHub API & Metadata Fetcher (Supports Cross-Repository Issues & PRs)
 # ==============================================================================
 
-class GitHubClient:
-    """Handles GitHub API calls to fetch issues, PRs, and review details."""
+def parse_github_url(url):
+    """
+    Extracts (owner, repo, kind, number) from any GitHub issue or PR URL.
+    Supports both local repo URLs and external repo URLs.
+    Example: https://github.com/org/repo/pull/42 -> ('org', 'repo', 'pull', 42)
+    """
+    if not url:
+        return None
+    m = re.search(r"github\.com/([^/]+)/([^/]+)/(issues|pull)/(\d+)", url, re.IGNORECASE)
+    if m:
+        return m.group(1), m.group(2).rstrip(".git"), m.group(3).lower(), int(m.group(4))
+    return None
 
-    def __init__(self, token=None, repo_owner="mansikalraa", repo_name="traceability-matrix-poc"):
-        self.repo_owner = repo_owner
-        self.repo_name = repo_name
+
+class GitHubClient:
+    """Handles GitHub API calls to fetch issues, PRs, and review details across repositories."""
+
+    def __init__(self, token=None, default_owner=None, default_repo=None):
         self.token = token or self._detect_token()
         self.ssl_ctx = ssl.create_default_context()
         self.ssl_ctx.check_hostname = False
         self.ssl_ctx.verify_mode = ssl.CERT_NONE
+
+        # Auto-detect default owner/repo from git remote if omitted
+        detected_owner, detected_repo = self._detect_repo_from_git()
+        self.default_owner = default_owner or detected_owner or "mansikalraa"
+        self.default_repo = default_repo or detected_repo or "traceability-matrix-poc"
+        self.cache = {}
+
+    def _detect_repo_from_git(self):
+        try:
+            res = subprocess.run(["git", "remote", "get-url", "origin"], capture_output=True, text=True, timeout=5)
+            url = res.stdout.strip()
+            m = re.search(r"github\.com[:/]([^/]+)/([^/.]+)", url)
+            if m:
+                return m.group(1), m.group(2)
+        except Exception:
+            pass
+        return None, None
 
     def _detect_token(self):
         """Attempts to find GitHub token in env or git credentials."""
@@ -93,8 +122,14 @@ class GitHubClient:
             pass
         return None
 
-    def _make_request(self, endpoint):
-        url = f"https://api.github.com/repos/{self.repo_owner}/{self.repo_name}/{endpoint}"
+    def _make_request(self, endpoint, owner=None, repo=None):
+        owner = owner or self.default_owner
+        repo = repo or self.default_repo
+        url = f"https://api.github.com/repos/{owner}/{repo}/{endpoint}"
+
+        if url in self.cache:
+            return self.cache[url]
+
         headers = {"User-Agent": "TraceabilityMatrixScript/1.0", "Accept": "application/vnd.github.v3+json"}
         if self.token:
             headers["Authorization"] = f"token {self.token}"
@@ -102,23 +137,51 @@ class GitHubClient:
         req = urllib.request.Request(url, headers=headers)
         try:
             with urllib.request.urlopen(req, context=self.ssl_ctx, timeout=10) as resp:
-                return json_loads(resp.read().decode("utf-8"))
-        except Exception as e:
+                data = json_loads(resp.read().decode("utf-8"))
+                self.cache[url] = data
+                return data
+        except Exception:
             return None
 
-    def fetch_all_issues(self):
+    def fetch_all_issues(self, owner=None, repo=None):
         """Fetches all issues from repository."""
-        data = self._make_request("issues?state=all&per_page=100")
+        data = self._make_request("issues?state=all&per_page=100", owner=owner, repo=repo)
         return data or []
 
-    def fetch_all_prs(self):
+    def fetch_all_prs(self, owner=None, repo=None):
         """Fetches all pull requests from repository."""
-        data = self._make_request("pulls?state=all&per_page=100")
+        data = self._make_request("pulls?state=all&per_page=100", owner=owner, repo=repo)
         return data or []
 
-    def fetch_pr_reviews(self, pr_number):
-        """Fetches reviews for a given PR."""
-        data = self._make_request(f"pulls/{pr_number}/reviews")
+    def fetch_pr_by_number_or_url(self, pr_number_or_url, owner=None, repo=None):
+        """Fetches PR details from local or external repository."""
+        if isinstance(pr_number_or_url, str) and "github.com" in pr_number_or_url:
+            parsed = parse_github_url(pr_number_or_url)
+            if parsed and parsed[2] == "pull":
+                owner, repo, _, num = parsed
+                return self._make_request(f"pulls/{num}", owner=owner, repo=repo)
+        num = pr_number_or_url if isinstance(pr_number_or_url, int) else int(pr_number_or_url)
+        return self._make_request(f"pulls/{num}", owner=owner, repo=repo)
+
+    def fetch_issue_by_url(self, url):
+        """Fetches single issue from local or external repository URL."""
+        parsed = parse_github_url(url)
+        if not parsed:
+            return None
+        owner, repo, kind, num = parsed
+        endpoint = f"issues/{num}" if kind == "issues" else f"pulls/{num}"
+        return self._make_request(endpoint, owner=owner, repo=repo)
+
+    def fetch_pr_reviews(self, pr_number_or_url, owner=None, repo=None):
+        """Fetches reviews for a given PR from local or external repo."""
+        if isinstance(pr_number_or_url, str) and "github.com" in pr_number_or_url:
+            parsed = parse_github_url(pr_number_or_url)
+            if parsed and parsed[2] == "pull":
+                owner, repo, _, num = parsed
+                data = self._make_request(f"pulls/{num}/reviews", owner=owner, repo=repo)
+                return data or []
+        num = pr_number_or_url if isinstance(pr_number_or_url, int) else int(pr_number_or_url)
+        data = self._make_request(f"pulls/{num}/reviews", owner=owner, repo=repo)
         return data or []
 
 
@@ -183,20 +246,30 @@ class TraceabilityMatrix:
         if link_match:
             text = link_match.group(1).strip()
             url = link_match.group(2).strip()
-            issue_match = re.search(r"/issues/(\d+)", url)
-            issue_num = int(issue_match.group(1)) if issue_match else None
-            return {"text": text, "url": url, "issue_number": issue_num, "is_link": True}
+            parsed_gh = parse_github_url(url)
+            if parsed_gh:
+                owner, repo, kind, num = parsed_gh
+                return {
+                    "text": text,
+                    "url": url,
+                    "issue_number": num,
+                    "owner": owner,
+                    "repo": repo,
+                    "kind": kind,
+                    "is_link": True,
+                }
+            return {"text": text, "url": url, "issue_number": None, "owner": None, "repo": None, "kind": None, "is_link": True}
         else:
             text = cell_str.strip()
-            return {"text": text, "url": None, "issue_number": None, "is_link": False}
+            return {"text": text, "url": None, "issue_number": None, "owner": None, "repo": None, "kind": None, "is_link": False}
 
 
-def audit_matrix(matrix, issues_map, prs_list):
+def audit_matrix(matrix, issues_map, prs_list, gh_client):
     """
     Evaluates incomplete rows in the traceability matrix.
     Row is incomplete if:
     1. Columns are not mapped (e.g. '--' or missing issue link)
-    2. Linked issue is still OPEN.
+    2. Linked issue is still OPEN (supports cross-repo issues).
     """
     audit_results = []
 
@@ -223,19 +296,36 @@ def audit_matrix(matrix, issues_map, prs_list):
             is_incomplete = True
             reasons.append("Verification status pending ('--')")
 
-        # 2. Check Linked Issues Status
+        # 2. Check Linked Issues Status (Local & External Repos)
         for cell in [req_cell, tc_cell]:
-            issue_num = cell.get("issue_number")
-            if issue_num and issue_num in issues_map:
-                issue_info = issues_map[issue_num]
+            if cell.get("url"):
+                issue_info = gh_client.fetch_issue_by_url(cell["url"])
+                if issue_info:
+                    state = issue_info.get("state")
+                    if state == "open":
+                        is_incomplete = True
+                        owner_prefix = f"{cell['owner']}/{cell['repo']}#" if cell.get("owner") else "#"
+                        reasons.append(f"Issue {owner_prefix}{cell['issue_number']} ({cell['text']}) is OPEN")
+            elif cell.get("issue_number") and cell["issue_number"] in issues_map:
+                issue_info = issues_map[cell["issue_number"]]
                 if issue_info.get("state") == "open":
                     is_incomplete = True
-                    reasons.append(f"Issue #{issue_num} ({cell['text']}) is OPEN")
+                    reasons.append(f"Issue #{cell['issue_number']} ({cell['text']}) is OPEN")
 
-        # Find linked PRs
+        # Find linked PRs (Local & External Repos)
         linked_prs = []
         for cell in [req_cell, tc_cell]:
             code = cell["text"]
+            url = cell.get("url")
+            parsed_gh = parse_github_url(url)
+
+            # If the cell link itself is a PR URL
+            if parsed_gh and parsed_gh[2] == "pull":
+                pr_data = gh_client.fetch_pr_by_number_or_url(url)
+                if pr_data and pr_data not in linked_prs:
+                    linked_prs.append(pr_data)
+
+            # Check PRs in primary repo
             issue_num = cell.get("issue_number")
             for pr in prs_list:
                 pr_body = pr.get("body") or ""
@@ -262,6 +352,7 @@ def audit_matrix(matrix, issues_map, prs_list):
         })
 
     return audit_results
+
 
 
 # ==============================================================================
@@ -1059,7 +1150,7 @@ def main():
     print(f"Fetched {len(issues)} issue(s) and {len(prs)} pull request(s).")
 
     # 4. Perform Matrix Audit
-    audit_results = audit_matrix(matrix, issues_map, prs)
+    audit_results = audit_matrix(matrix, issues_map, prs, gh_client)
     incomplete_count = sum(1 for item in audit_results if item["is_incomplete"])
     print(f"Audit completed: {incomplete_count} incomplete row(s) flagged.")
 
